@@ -1,0 +1,6 @@
+{
+  "name": "Indian E-commerce Catalog Stylist & AI Prompt Engineer",
+  "description": "Analyze Indian ethnic wear, fabrics, sarees, and garments to generate 4-photo e-commerce listing prompts for Meesho, Myntra, and Amazon with 100% design fidelity.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
