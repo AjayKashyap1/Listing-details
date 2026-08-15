@@ -126,7 +126,7 @@ export default function App() {
         headers["x-custom-provider"] = apiConfig.provider;
       }
 
-      const response = await fetch("/api/analyze-catalog", {
+      let response = await fetch("/api/analyze-catalog", {
         method: "POST",
         headers,
         body: JSON.stringify({
@@ -136,17 +136,39 @@ export default function App() {
         }),
       });
 
+      // If server was temporarily rebooting or returned 404/502/503, retry automatically once
+      if (!response.ok && (response.status === 404 || response.status >= 500)) {
+        console.warn(`Initial request returned ${response.status}, retrying in 1s...`);
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        try {
+          const retryResponse = await fetch("/api/analyze-catalog", {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              imageBase64,
+              options,
+              customApiConfig: apiConfig.apiKey.trim() ? apiConfig : undefined,
+            }),
+          });
+          if (retryResponse.ok) {
+            response = retryResponse;
+          }
+        } catch (retryErr) {
+          console.warn("Auto-retry failed:", retryErr);
+        }
+      }
+
       clearTimeout(timer1);
       clearTimeout(timer2);
 
       if (!response.ok) {
         const errData = await response.json().catch(() => ({}));
-        let message = errData.error || `Analysis failed (status ${response.status})`;
+        let message = errData.error || `Analysis request returned status ${response.status}.`;
         if (typeof message === "object") {
           message = JSON.stringify(message);
         }
         if (response.status === 503 || message.includes("503") || message.includes("high demand")) {
-          message = "The AI service is experiencing high demand. Please click 'Try Again Now' to re-run with our fallback models.";
+          message = "The AI service is experiencing high demand. Please click 'Try Again Now' to re-run.";
         }
         throw new Error(message);
       }
