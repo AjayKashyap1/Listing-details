@@ -16,6 +16,8 @@ import {
   JewelleryPreference,
   CustomApiConfig,
 } from "./types";
+import { analyzeCatalogImage } from "./services/catalogService";
+import { generateClientStudioPreviewSVG } from "./services/svgPreview";
 import {
   Sparkles,
   AlertCircle,
@@ -116,65 +118,12 @@ export default function App() {
         setLoadingStep("Synthesizing 4-shot studio prompts for " + options.platformPreset.toUpperCase() + "...");
       }, 3200);
 
-      const headers: Record<string, string> = {
-        "Content-Type": "application/json",
-      };
-      if (apiConfig.apiKey.trim()) {
-        headers["x-custom-api-key"] = apiConfig.apiKey.trim();
-        headers["x-custom-base-url"] = apiConfig.baseUrl.trim();
-        headers["x-custom-model-name"] = apiConfig.modelName.trim();
-        headers["x-custom-provider"] = apiConfig.provider;
-      }
-
-      let response = await fetch("/api/analyze-catalog", {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          imageBase64,
-          options,
-          customApiConfig: apiConfig.apiKey.trim() ? apiConfig : undefined,
-        }),
-      });
-
-      // If server was temporarily rebooting or returned 404/502/503, retry automatically once
-      if (!response.ok && (response.status === 404 || response.status >= 500)) {
-        console.warn(`Initial request returned ${response.status}, retrying in 1s...`);
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-        try {
-          const retryResponse = await fetch("/api/analyze-catalog", {
-            method: "POST",
-            headers,
-            body: JSON.stringify({
-              imageBase64,
-              options,
-              customApiConfig: apiConfig.apiKey.trim() ? apiConfig : undefined,
-            }),
-          });
-          if (retryResponse.ok) {
-            response = retryResponse;
-          }
-        } catch (retryErr) {
-          console.warn("Auto-retry failed:", retryErr);
-        }
-      }
+      const result = await analyzeCatalogImage(imageBase64, options, apiConfig);
 
       clearTimeout(timer1);
       clearTimeout(timer2);
 
-      if (!response.ok) {
-        const errData = await response.json().catch(() => ({}));
-        let message = errData.error || `Analysis request returned status ${response.status}.`;
-        if (typeof message === "object") {
-          message = JSON.stringify(message);
-        }
-        if (response.status === 503 || message.includes("503") || message.includes("high demand")) {
-          message = "The AI service is experiencing high demand. Please click 'Try Again Now' to re-run.";
-        }
-        throw new Error(message);
-      }
-
-      const data: CatalogAnalysisResult = await response.json();
-      setAnalysisResult(data);
+      setAnalysisResult(result);
     } catch (err: any) {
       console.error("Analysis failed:", err);
       let formattedMsg = err.message || "Failed to analyze product photo. Please try again.";
@@ -199,40 +148,51 @@ export default function App() {
     setGeneratingPreviewId(shotId);
 
     try {
-      const headers: Record<string, string> = {
-        "Content-Type": "application/json",
-      };
-      if (apiConfig.apiKey.trim()) {
-        headers["x-custom-api-key"] = apiConfig.apiKey.trim();
-        headers["x-custom-base-url"] = apiConfig.baseUrl.trim();
-        headers["x-custom-model-name"] = apiConfig.modelName.trim();
-        headers["x-custom-provider"] = apiConfig.provider;
+      let previewUrl = "";
+      try {
+        const headers: Record<string, string> = {
+          "Content-Type": "application/json",
+        };
+        if (apiConfig.apiKey.trim()) {
+          headers["x-custom-api-key"] = apiConfig.apiKey.trim();
+          headers["x-custom-base-url"] = apiConfig.baseUrl.trim();
+          headers["x-custom-model-name"] = apiConfig.modelName.trim();
+          headers["x-custom-provider"] = apiConfig.provider;
+        }
+
+        const response = await fetch("/api/generate-preview", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            prompt: promptText,
+            aspectRatio: "3:4",
+            customApiKey: apiConfig.apiKey.trim() || undefined,
+          }),
+        });
+
+        if (response.ok) {
+          const data = await response.json().catch(() => ({}));
+          if (data?.imageUrl) {
+            previewUrl = data.imageUrl;
+          }
+        }
+      } catch (srvErr) {
+        console.info("Server preview generation unavailable, using client SVG renderer:", srvErr);
       }
 
-      const response = await fetch("/api/generate-preview", {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          prompt: promptText,
-          aspectRatio: "3:4",
-          customApiKey: apiConfig.apiKey.trim() || undefined,
-        }),
-      });
-
-      if (!response.ok) {
-        const errData = await response.json().catch(() => ({}));
-        throw new Error(errData.error || "Failed to generate image preview.");
+      // If server returned 404 (on Netlify/static hosting) or failed, generate high-res SVG preview directly in browser
+      if (!previewUrl) {
+        previewUrl = generateClientStudioPreviewSVG(promptText);
       }
 
-      const data = await response.json();
-      if (data.imageUrl) {
+      if (previewUrl) {
         setAnalysisResult((prev) => {
           if (!prev) return prev;
           const updated = { ...prev };
-          if (shotId === "shot1_hero") updated.prompts.heroStudioShot.previewImageUrl = data.imageUrl;
-          if (shotId === "shot2_model") updated.prompts.fullBodyModelShot.previewImageUrl = data.imageUrl;
-          if (shotId === "shot3_macro") updated.prompts.textureMacroShot.previewImageUrl = data.imageUrl;
-          if (shotId === "shot4_lifestyle") updated.prompts.curatedLifestyleShot.previewImageUrl = data.imageUrl;
+          if (shotId === "shot1_hero") updated.prompts.heroStudioShot.previewImageUrl = previewUrl;
+          if (shotId === "shot2_model") updated.prompts.fullBodyModelShot.previewImageUrl = previewUrl;
+          if (shotId === "shot3_macro") updated.prompts.textureMacroShot.previewImageUrl = previewUrl;
+          if (shotId === "shot4_lifestyle") updated.prompts.curatedLifestyleShot.previewImageUrl = previewUrl;
           return updated;
         });
       }
