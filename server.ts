@@ -14,13 +14,15 @@ app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
 // Flexible GoogleGenAI initialization supporting custom API keys
-function getGenAI(customApiKey?: string): GoogleGenAI {
-  const apiKey = customApiKey?.trim() || process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error("GEMINI_API_KEY is not configured in environment or custom settings.");
+function getGenAI(customApiKey?: string): GoogleGenAI | null {
+  const custom = customApiKey?.trim();
+  // Never pass OpenAI/OpenRouter keys (sk-...) to Google GenAI SDK
+  const apiKey = (custom && !custom.startsWith("sk-")) ? custom : process.env.GEMINI_API_KEY;
+  if (!apiKey || !apiKey.trim()) {
+    return null;
   }
   return new GoogleGenAI({
-    apiKey,
+    apiKey: apiKey.trim(),
     httpOptions: {
       headers: {
         "User-Agent": "aistudio-build",
@@ -51,7 +53,7 @@ app.get("/api/health", (_req, res) => {
 // Test Custom API Key / Base URL / Model Endpoint
 app.post("/api/test-api-key", async (req, res) => {
   try {
-    const { apiKey, baseUrl, modelName, provider } = req.body;
+    const { apiKey, baseUrl, modelName, provider } = req.body || {};
     if (!apiKey || !apiKey.trim()) {
       return res.status(400).json({ valid: false, error: "Please enter an API Key to test." });
     }
@@ -60,44 +62,85 @@ app.post("/api/test-api-key", async (req, res) => {
     const effectiveBaseUrl = baseUrl?.trim();
     const effectiveModel = modelName?.trim();
 
-    // If a custom Base URL is provided or provider is OpenRouter / AgentRouter / Custom
-    if (effectiveBaseUrl || provider === "openrouter" || provider === "agentrouter" || provider === "custom") {
-      const urlToUse = effectiveBaseUrl || (provider === "openrouter" ? "https://openrouter.ai/api/v1" : "https://api.agentrouter.com/v1");
-      const modelToTest = effectiveModel || (provider === "openrouter" ? "google/gemini-2.5-flash" : "gpt-4o-mini");
+    // If a custom Base URL is provided or provider is OpenRouter / AgentRouter / Custom or starts with sk-
+    if (
+      effectiveBaseUrl ||
+      provider === "openrouter" ||
+      provider === "agentrouter" ||
+      provider === "custom" ||
+      trimmedKey.startsWith("sk-")
+    ) {
+      const urlToUse =
+        effectiveBaseUrl ||
+        (provider === "agentrouter"
+          ? "https://api.agentrouter.com/v1"
+          : "https://openrouter.ai/api/v1");
+      const modelToTest =
+        effectiveModel ||
+        (provider === "agentrouter" ? "gpt-4o-mini" : "openai/gpt-4o-mini");
       const endpoint = `${urlToUse.replace(/\/+$/, "")}/chat/completions`;
 
       console.log(`Testing custom endpoint: ${endpoint} with model ${modelToTest}...`);
 
-      const response = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${trimmedKey}`,
-          "HTTP-Referer": "https://ai.studio/build",
-          "X-Title": "Indian Catalog Stylist",
-        },
-        body: JSON.stringify({
-          model: modelToTest,
-          messages: [{ role: "user", content: "Reply with 'Connected successfully.'" }],
-          max_tokens: 50,
-        }),
-      });
+      let response: Response;
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 12000);
+
+        response = await fetch(endpoint, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${trimmedKey}`,
+            "HTTP-Referer": "https://ai.studio/build",
+            "X-Title": "Indian Catalog Stylist",
+            "User-Agent": "IndianCatalogStylist/1.0",
+          },
+          body: JSON.stringify({
+            model: modelToTest,
+            messages: [{ role: "user", content: "Reply with 'Connected successfully.'" }],
+            max_tokens: 30,
+          }),
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+      } catch (fetchErr: any) {
+        const isAbort = fetchErr?.name === "AbortError" || fetchErr?.message?.includes("abort");
+        return res.status(400).json({
+          valid: false,
+          error: isAbort
+            ? `Connection to ${urlToUse} timed out. Please check your network or endpoint.`
+            : `Network connection failed: ${fetchErr.message}. Please check Base URL (${urlToUse}).`,
+        });
+      }
+
+      const rawBody = await response.text().catch(() => "");
 
       if (!response.ok) {
-        const errBody = await response.text().catch(() => "");
-        let parsedErr = errBody;
+        let parsedErr = rawBody;
         try {
-          const jsonErr = JSON.parse(errBody);
-          parsedErr = jsonErr?.error?.message || jsonErr?.message || errBody;
+          const jsonErr = JSON.parse(rawBody);
+          parsedErr = jsonErr?.error?.message || jsonErr?.message || rawBody;
         } catch {}
+        if (parsedErr.startsWith("<!doctype") || parsedErr.startsWith("<html")) {
+          parsedErr = `Endpoint returned HTML page (${response.status}) instead of API response. Please verify Base URL is correct (e.g. ${urlToUse}).`;
+        }
         return res.status(400).json({
           valid: false,
           error: `API Test failed (${response.status}): ${parsedErr.slice(0, 250)}`,
         });
       }
 
-      const data = await response.json();
-      const reply = data.choices?.[0]?.message?.content || "Connected!";
+      let data: any = null;
+      try {
+        data = rawBody ? JSON.parse(rawBody) : null;
+      } catch {
+        return res.status(400).json({
+          valid: false,
+          error: `Endpoint returned non-JSON response (${response.status}). Please check your Base URL (${urlToUse}).`,
+        });
+      }
+
       return res.json({
         valid: true,
         message: `Successfully connected to ${provider ? provider.toUpperCase() : "Custom Endpoint"} (${modelToTest})!`,
@@ -105,6 +148,13 @@ app.post("/api/test-api-key", async (req, res) => {
     }
 
     // Default to Gemini SDK Test
+    if (!trimmedKey.startsWith("AIza") && trimmedKey.startsWith("sk-")) {
+      return res.status(400).json({
+        valid: false,
+        error: "This key looks like an OpenAI / OpenRouter key (starts with 'sk-'). Please select OpenRouter or AgentRouter from the provider tabs above.",
+      });
+    }
+
     const testAI = new GoogleGenAI({
       apiKey: trimmedKey,
       httpOptions: {
@@ -530,31 +580,59 @@ async function analyzeCatalogWithOpenAICompatible(config: {
     model: config.modelName || "google/gemini-2.5-flash",
     messages,
     temperature: 0.2,
-    response_format: { type: "json_object" },
   };
+
+  // Only pass json_object format for models known to support it
+  if (
+    config.modelName?.includes("gemini") ||
+    config.modelName?.includes("gpt") ||
+    config.modelName?.includes("deepseek")
+  ) {
+    payload.response_format = { type: "json_object" };
+  }
 
   console.log(`Sending multimodal catalog analysis to ${endpoint} with model: ${payload.model}...`);
 
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${config.apiKey.trim()}`,
-      "HTTP-Referer": "https://ai.studio/build",
-      "X-Title": "Indian Catalog Stylist",
-    },
-    body: JSON.stringify(payload),
-  });
-
-  if (!response.ok) {
-    const errText = await response.text().catch(() => "");
-    throw new Error(`Custom API returned status ${response.status}: ${errText.slice(0, 300)}`);
+  let response: Response;
+  try {
+    response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey.trim()}`,
+        "HTTP-Referer": "https://ai.studio/build",
+        "X-Title": "Indian Catalog Stylist",
+      },
+      body: JSON.stringify(payload),
+    });
+  } catch (fetchErr: any) {
+    throw new Error(`Connection to ${urlToUse} failed: ${fetchErr.message}`);
   }
 
-  const data = await response.json();
-  const rawText = data.choices?.[0]?.message?.content;
+  const rawBody = await response.text().catch(() => "");
+
+  if (!response.ok) {
+    let parsedErr = rawBody;
+    try {
+      const jsonErr = JSON.parse(rawBody);
+      parsedErr = jsonErr?.error?.message || jsonErr?.message || rawBody;
+    } catch {}
+    if (parsedErr.startsWith("<!doctype") || parsedErr.startsWith("<html")) {
+      parsedErr = `Endpoint returned HTML page (${response.status}) instead of JSON. Please verify Base URL (${urlToUse}).`;
+    }
+    throw new Error(`Custom API returned status ${response.status}: ${parsedErr.slice(0, 300)}`);
+  }
+
+  let data: any = null;
+  try {
+    data = JSON.parse(rawBody);
+  } catch {
+    throw new Error(`Custom API returned non-JSON response (${response.status}): ${rawBody.slice(0, 200)}`);
+  }
+
+  const rawText = data?.choices?.[0]?.message?.content;
   if (!rawText) {
-    throw new Error("No text content returned from custom API.");
+    throw new Error("No text content returned in choices from custom API.");
   }
 
   const cleaned = extractJSONString(rawText);
@@ -999,7 +1077,7 @@ Always output strictly valid JSON matching the required schema.
       providerToUse === "openrouter" ||
       providerToUse === "agentrouter" ||
       providerToUse === "custom" ||
-      (apiKeyToUse && apiKeyToUse.startsWith("sk-or-"));
+      (apiKeyToUse && apiKeyToUse.startsWith("sk-"));
 
     if (isOpenAICompatible && apiKeyToUse) {
       try {
@@ -1029,50 +1107,57 @@ Always output strictly valid JSON matching the required schema.
     }
 
     if (!successfulResult) {
-      try {
-        const ai = getGenAI(apiKeyToUse && !apiKeyToUse.startsWith("sk-or-") ? apiKeyToUse : undefined);
+      const isGeminiKey =
+        (!apiKeyToUse || !apiKeyToUse.startsWith("sk-")) &&
+        (providerToUse === "gemini" || !isOpenAICompatible || !apiKeyToUse);
 
-        for (const modelName of candidateModels) {
-          try {
-            console.log(`Analyzing catalog with model: ${modelName}...`);
+      if (isGeminiKey) {
+        try {
+          const ai = getGenAI(apiKeyToUse);
+          if (ai) {
+            for (const modelName of candidateModels) {
+              try {
+                console.log(`Analyzing catalog with model: ${modelName}...`);
 
-            const response = await ai.models.generateContent({
-              model: modelName,
-              contents: [
-                {
-                  parts: [
+                const response = await ai.models.generateContent({
+                  model: modelName,
+                  contents: [
                     {
-                      inlineData: {
-                        data: cleanBase64,
-                        mimeType,
-                      },
-                    },
-                    {
-                      text: promptText,
+                      parts: [
+                        {
+                          inlineData: {
+                            data: cleanBase64,
+                            mimeType,
+                          },
+                        },
+                        {
+                          text: promptText,
+                        },
+                      ],
                     },
                   ],
-                },
-              ],
-              config: {
-                responseMimeType: "application/json",
-                responseSchema: responseSchemaConfig,
-              },
-            });
+                  config: {
+                    responseMimeType: "application/json",
+                    responseSchema: responseSchemaConfig,
+                  },
+                });
 
-            const textOutput = response.text;
-            if (textOutput) {
-              const cleanedJson = extractJSONString(textOutput);
-              successfulResult = JSON.parse(cleanedJson);
-              console.log(`Catalog analysis succeeded with ${modelName}`);
-              break;
+                const textOutput = response.text;
+                if (textOutput) {
+                  const cleanedJson = extractJSONString(textOutput);
+                  successfulResult = JSON.parse(cleanedJson);
+                  console.log(`Catalog analysis succeeded with ${modelName}`);
+                  break;
+                }
+              } catch (modelErr: any) {
+                console.warn(`Model ${modelName} call failed:`, modelErr?.message);
+                await sleep(300);
+              }
             }
-          } catch (modelErr: any) {
-            console.warn(`Model ${modelName} call failed:`, modelErr?.message);
-            await sleep(400);
           }
+        } catch (sdkInitErr: any) {
+          console.warn("GenAI SDK init error:", sdkInitErr?.message);
         }
-      } catch (sdkInitErr: any) {
-        console.warn("GenAI SDK init error:", sdkInitErr?.message);
       }
     }
 
@@ -1104,41 +1189,45 @@ app.post("/api/generate-preview", async (req, res) => {
     const imageModels = ["gemini-3.1-flash-lite-image", "gemini-3.1-flash-image"];
 
     try {
-      const ai = getGenAI(apiKeyToUse);
+      // Only pass key if it's a Gemini key (not sk-...)
+      const geminiKey = apiKeyToUse && !apiKeyToUse.startsWith("sk-") ? apiKeyToUse : undefined;
+      const ai = getGenAI(geminiKey);
 
-      for (const imgModel of imageModels) {
-        try {
-          const imageGenResponse = await ai.models.generateContent({
-            model: imgModel,
-            contents: {
-              parts: [
-                {
-                  text: `High quality professional commercial e-commerce product fashion photograph, highly realistic 8k, sharp focus: ${prompt}`,
-                },
-              ],
-            },
-            config: {
-              imageConfig: {
-                aspectRatio: targetRatio as any,
+      if (ai) {
+        for (const imgModel of imageModels) {
+          try {
+            const imageGenResponse = await ai.models.generateContent({
+              model: imgModel,
+              contents: {
+                parts: [
+                  {
+                    text: `High quality professional commercial e-commerce product fashion photograph, highly realistic 8k, sharp focus: ${prompt}`,
+                  },
+                ],
               },
-            },
-          });
+              config: {
+                imageConfig: {
+                  aspectRatio: targetRatio as any,
+                },
+              },
+            });
 
-          if (imageGenResponse.candidates?.[0]?.content?.parts) {
-            for (const part of imageGenResponse.candidates[0].content.parts) {
-              if (part.inlineData && part.inlineData.data) {
-                const mime = part.inlineData.mimeType || "image/png";
-                generatedImageUrl = `data:${mime};base64,${part.inlineData.data}`;
-                break;
+            if (imageGenResponse.candidates?.[0]?.content?.parts) {
+              for (const part of imageGenResponse.candidates[0].content.parts) {
+                if (part.inlineData && part.inlineData.data) {
+                  const mime = part.inlineData.mimeType || "image/png";
+                  generatedImageUrl = `data:${mime};base64,${part.inlineData.data}`;
+                  break;
+                }
               }
             }
-          }
 
-          if (generatedImageUrl) {
-            break;
+            if (generatedImageUrl) {
+              break;
+            }
+          } catch (imgErr: any) {
+            console.warn(`Image generation model ${imgModel} returned:`, imgErr?.message);
           }
-        } catch (imgErr: any) {
-          console.warn(`Image generation model ${imgModel} returned:`, imgErr?.message);
         }
       }
     } catch (genAiErr: any) {

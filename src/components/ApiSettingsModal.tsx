@@ -154,30 +154,107 @@ export const ApiSettingsModal: React.FC<ApiSettingsModalProps> = ({
     setTesting(true);
     setTestResult(null);
 
-    try {
-      const response = await fetch("/api/test-api-key", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          apiKey: apiKey.trim(),
-          baseUrl: baseUrl.trim(),
-          modelName: modelName.trim(),
-          provider,
-        }),
-      });
+    const trimmedKey = apiKey.trim();
+    const effectiveBaseUrl = baseUrl.trim();
+    const effectiveModel = modelName.trim();
 
-      const data = await response.json();
-      if (response.ok && data.valid) {
-        setTestResult({
-          success: true,
-          message: data.message || "Connection verified successfully! Everything is working.",
+    try {
+      // 1. Try server verification first
+      let serverOk = false;
+      let serverError = "";
+      try {
+        const response = await fetch("/api/test-api-key", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            apiKey: trimmedKey,
+            baseUrl: effectiveBaseUrl,
+            modelName: effectiveModel,
+            provider,
+          }),
         });
-      } else {
-        setTestResult({
-          success: false,
-          message: data.error || "Failed to verify connection. Please check API Key, Base URL and Model Name.",
-        });
+
+        const rawText = await response.text().catch(() => "");
+        let data: any = null;
+        try {
+          data = rawText ? JSON.parse(rawText) : null;
+        } catch {
+          data = null;
+        }
+
+        if (response.ok && data?.valid) {
+          setTestResult({
+            success: true,
+            message: data.message || "Connection verified successfully! Everything is working.",
+          });
+          serverOk = true;
+          return;
+        } else if (data?.error) {
+          serverError = data.error;
+        }
+      } catch (srvErr: any) {
+        serverError = srvErr?.message || "Server verification error";
       }
+
+      if (serverOk) return;
+
+      // 2. If it's an OpenAI/OpenRouter compatible provider, try direct client-side test as a fallback
+      if (provider === "openrouter" || provider === "agentrouter" || provider === "custom" || trimmedKey.startsWith("sk-")) {
+        const urlToUse = effectiveBaseUrl || (provider === "agentrouter" ? "https://api.agentrouter.com/v1" : "https://openrouter.ai/api/v1");
+        const endpoint = `${urlToUse.replace(/\/+$/, "")}/chat/completions`;
+        const testModel = effectiveModel || (provider === "agentrouter" ? "gpt-4o-mini" : "openai/gpt-4o-mini");
+
+        try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+          const directRes = await fetch(endpoint, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${trimmedKey}`,
+              "HTTP-Referer": window.location.origin,
+              "X-Title": "Indian Catalog Stylist",
+            },
+            body: JSON.stringify({
+              model: testModel,
+              messages: [{ role: "user", content: "Reply with 'Connected.'" }],
+              max_tokens: 20,
+            }),
+            signal: controller.signal,
+          });
+          clearTimeout(timeoutId);
+
+          const directText = await directRes.text().catch(() => "");
+          let directData: any = null;
+          try {
+            directData = directText ? JSON.parse(directText) : null;
+          } catch {}
+
+          if (directRes.ok && (directData?.choices || directData?.id)) {
+            setTestResult({
+              success: true,
+              message: `Connection successfully verified with ${provider.toUpperCase()} (${testModel})!`,
+            });
+            return;
+          }
+
+          if (directData?.error?.message) {
+            setTestResult({
+              success: false,
+              message: `${provider.toUpperCase()} Error (${directRes.status}): ${directData.error.message}`,
+            });
+            return;
+          }
+        } catch (directErr: any) {
+          console.warn("Direct test attempt failed:", directErr);
+        }
+      }
+
+      setTestResult({
+        success: false,
+        message: serverError || "Failed to verify connection. Please check your API Key, Base URL and Model ID.",
+      });
     } catch (err: any) {
       setTestResult({
         success: false,
